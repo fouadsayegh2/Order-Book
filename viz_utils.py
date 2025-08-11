@@ -1,0 +1,322 @@
+import re, math
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+def plot_order_book_table(df: pd.DataFrame, event_id, n: int = 1, max_cols_per_row: int = 5, fig_width: int = 2500):
+    if not isinstance(df.index, pd.RangeIndex) or not df.index.is_unique:
+        df = df.reset_index(drop=True)
+
+    # --- config ---
+    event_id_col = "event_id"
+    bid_prefix, ask_prefix = "Bid", "Ask"
+    price_field, size_field, orders_field = "Price", "Size", "Orders"
+    bid_color, ask_color = "#2ecc71", "#e74c3c"
+    bid_fill  = "rgba(46, 204, 113, 0.14)"
+    ask_fill  = "rgba(231, 76, 60, 0.14)"
+    ROW_HEIGHT = 360
+    TOP_MARGIN_EXTRA = 120
+
+    # --- locate starting row ---
+    if event_id_col not in df.columns:
+        raise ValueError(f"Expected '{event_id_col}' column in df.")
+    if "EntryType" not in df.columns:
+        raise ValueError("Expected 'EntryType' column in df.")
+
+    row_df = df.loc[df[event_id_col] == event_id]
+    if row_df.empty:
+        raise ValueError(f"No rows found with {event_id_col} == {event_id!r}.")
+    start_pos = int(df.index.get_indexer([row_df.index[0]])[0])
+    # start_pos = int(row_df.index[0])
+
+    # Build positions: only rows with EntryType == 1 starting at start_pos
+    n = max(1, int(n))
+    positions = []
+    for i in range(start_pos, len(df)):
+        et = df.iloc[i].get("EntryType")
+        try:
+            is_one = (pd.notna(et) and int(et) == 1)
+        except Exception:
+            is_one = False
+        if is_one:
+            positions.append(i)
+            if len(positions) == n:
+                break
+
+    if not positions:
+        raise ValueError("No snapshots with EntryType == 1 found at/after the given event_id.")
+
+    # --- helpers ---
+    def _extract_side(row: pd.Series, side_prefix: str):
+        rx_price  = re.compile(rf"^{side_prefix}{price_field}(\d+)$",  re.IGNORECASE)
+        rx_size   = re.compile(rf"^{side_prefix}{size_field}(\d+)$",   re.IGNORECASE)
+        rx_orders = re.compile(rf"^{side_prefix}{orders_field}(\d+)$", re.IGNORECASE)
+        prices, sizes, orders = {}, {}, {}
+        for col, val in row.items():
+            if pd.isna(val):
+                continue
+            m = rx_price.match(col);  m and prices.setdefault(int(m.group(1)), float(val))
+            m = rx_size.match(col);   m and sizes.setdefault(int(m.group(1)),  float(val))
+            m = rx_orders.match(col); m and orders.setdefault(int(m.group(1)), float(val))
+        levels = sorted(prices.keys() & sizes.keys())
+        if side_prefix.lower().startswith("bid"):
+            levels.sort(key=lambda k: prices[k], reverse=True)
+        else:
+            levels.sort(key=lambda k: prices[k])
+        return (
+            [prices[k] for k in levels],
+            [sizes[k]  for k in levels],
+            [orders.get(k) for k in levels],
+        )
+
+    def _fmt_int(x):   return "" if x is None or pd.isna(x) else f"{int(round(float(x))):,}"
+    def _fmt_size(x):  return "" if x is None or pd.isna(x) else (f"{int(x):,}" if abs(x-round(x))<1e-9 else f"{x:g}")
+    def _fmt_price(x): return "" if x is None or pd.isna(x) else f"{float(x):g}"
+
+    def _build_table_for_row(row: pd.Series):
+        bid_p, bid_s, bid_o = _extract_side(row, bid_prefix)
+        ask_p, ask_s, ask_o = _extract_side(row, ask_prefix)
+
+        if not bid_p and not ask_p:
+            values = [[""], [""], [""], [""], [""], [""]]
+        else:
+            r = max(len(bid_p), len(ask_p))
+            col_bo, col_bs, col_bp, col_ap, col_as, col_ao = [], [], [], [], [], []
+            for i in range(r):
+                if i < len(bid_p):
+                    col_bo.append(_fmt_int(bid_o[i])); col_bs.append(_fmt_size(bid_s[i])); col_bp.append(_fmt_price(bid_p[i]))
+                else:
+                    col_bo.append(""); col_bs.append(""); col_bp.append("")
+                if i < len(ask_p):
+                    col_ap.append(_fmt_price(ask_p[i])); col_as.append(_fmt_size(ask_s[i])); col_ao.append(_fmt_int(ask_o[i]))
+                else:
+                    col_ap.append(""); col_as.append(""); col_ao.append("")
+            values = [col_bo, col_bs, col_bp, col_ap, col_as, col_ao]
+
+        return go.Table(
+            columnwidth=[0.9, 1.1, 1.1, 1.1, 1.1, 0.9],
+            header=dict(
+                values=["Bid Orders","Bid Size","Bid Price","Ask Price","Ask Size","Ask Orders"],
+                align="center",
+                fill_color=[bid_color, bid_color, bid_color, ask_color, ask_color, ask_color],
+                font=dict(color="white", size=12),
+                height=30,
+            ),
+            cells=dict(
+                values=values,
+                align=["right","right","right","left","right","right"],
+                fill=dict(color=[
+                    [bid_fill]*len(values[0]), [bid_fill]*len(values[1]), [bid_fill]*len(values[2]),
+                    [ask_fill]*len(values[3]), [ask_fill]*len(values[4]), [ask_fill]*len(values[5]),
+                ]),
+                font=dict(
+                    color=[
+                        [bid_color]*len(values[0]), [bid_color]*len(values[1]), [bid_color]*len(values[2]),
+                        [ask_color]*len(values[3]), [ask_color]*len(values[4]), [ask_color]*len(values[5]),
+                    ],
+                    size=12
+                ),
+                height=26,
+            ),
+        )
+
+    # --- grid & titles ---
+    cols = max_cols_per_row
+    rows = math.ceil(len(positions) / cols)
+    specs = [[{"type":"table"} for _ in range(cols)] for _ in range(rows)]
+
+    titles = []
+    for pos in positions:
+        row = df.iloc[pos]
+        base = (str(row["timestamp"]) if "timestamp" in df.columns and pd.notna(row.get("timestamp", None))
+                else f"id={row[event_id_col]}")
+        if "last_entrytype" in df.columns:
+            le = row.get("last_entrytype")
+            base = f"{base} — last_entrytype={'' if pd.isna(le) else le}"
+        titles.append(base)
+    titles += [""] * (rows*cols - len(titles))  # pad
+
+    fig = make_subplots(
+        rows=rows, cols=cols, specs=specs,
+        horizontal_spacing=0.05, vertical_spacing=0.1,
+        subplot_titles=tuple(titles),
+    )
+
+    for i, pos in enumerate(positions):
+        r = i // cols + 1
+        c = i % cols + 1
+        fig.add_trace(_build_table_for_row(df.iloc[pos]), row=r, col=c)
+
+    # --- fixed width; computed height ---
+    fig_height = rows * ROW_HEIGHT + TOP_MARGIN_EXTRA
+    fig.update_layout(
+        title=f"Order Book Quotes snapshots starting at {event_id_col}={event_id}",
+        autosize=False,
+        width=fig_width,
+        height=fig_height,
+        margin=dict(l=10, r=10, t=90, b=10),
+    )
+    return fig
+
+
+# This turns one wide snapshot row into ordered lists to render and compare reliably.
+def _parse_side(row: pd.Series, side_prefix: str, price_field="Price", size_field="Size", orders_field="Orders"):
+    """Parse one row into dicts per level + the display-ordered level list."""
+    rx_price = re.compile(rf"^{side_prefix}{price_field}(\d+)$", re.IGNORECASE)
+    rx_size = re.compile(rf"^{side_prefix}{size_field}(\d+)$", re.IGNORECASE)
+    rx_orders = re.compile(rf"^{side_prefix}{orders_field}(\d+)$", re.IGNORECASE)
+    prices, sizes, orders = {}, {}, {}
+    for col, val in row.items():
+        if pd.isna(val):
+            continue
+        m = rx_price.match(col);  m and prices.setdefault(int(m.group(1)), float(val))
+        m = rx_size.match(col);   m and sizes.setdefault(int(m.group(1)),  float(val))
+        m = rx_orders.match(col); m and orders.setdefault(int(m.group(1)), float(val))
+    levels = sorted(prices.keys() & sizes.keys())
+    if side_prefix.lower().startswith("bid"):
+        levels.sort(key=lambda k: prices[k], reverse=True)
+    else:
+        levels.sort(key=lambda k: prices[k])
+    return prices, sizes, orders, levels
+
+# This returns true / false if flags say changed, and none if no relevant flags exist.
+def _changed_from_flags(row: pd.Series, side: str, field: str, lvl: int):
+    currentColumn = f"{side}{field}{lvl}"
+    curr = row.get(currentColumn)
+
+    # The previous column name.
+    if field == "Price":
+        previousColumn = f"{side}LevelPrevPrice{lvl}"
+    elif field == "Size":
+        previousColumn = f"{side}LevelPrevSize{lvl}"
+    else: # Orders
+        previousColumn = f"{side}LevelPrevOrders{lvl}"
+
+    have_any_flag = False
+
+    # This compares previous vs current if previous exists.
+    if previousColumn in row.index and pd.notna(row[previousColumn]) and pd.notna(curr):
+        have_any_flag = True
+        try:
+            return float(row[previousColumn]) != float(curr)
+        except Exception:
+            return row[previousColumn] != curr
+
+    # Checking the Added / Removed (> 0 means a change).
+    if field in ("Size","Orders"):
+        addColumn = f"{side}{field}Added{lvl}"
+        removeColumn = f"{side}{field}Removed{lvl}"
+        for col in (addColumn, removeColumn):
+            if col in row.index and pd.notna(row[col]):
+                have_any_flag = True
+                try:
+                    if float(row[col]) > 0:
+                        return True
+                except Exception:
+                    if bool(row[col]):
+                        return True
+
+    # If there is no relevant flags present.
+    return None if not have_any_flag else False
+
+# This finds the previous snapshot position before the given position.
+def _prev_snapshot_pos(df, pos):
+    for i in range(pos - 1, -1, -1):
+        try:
+            if int(df.at[i, "EntryType"]) == 1:
+                return i
+        except Exception:
+            pass
+    return None
+
+
+def _cell_changed(row, previousRow, side, field, lvl):
+    # This checks if the cell has flags indicating a change.
+    byFlags = _changed_from_flags(row, side, field, lvl)
+    if byFlags is not None:
+        return byFlags
+    # This compares to previous snapshot if flags absent.
+    if previousRow is None:
+        return False
+    col = f"{side}{field}{lvl}"
+    now = row.get(col)
+    prev = previousRow.get(col)
+    if pd.isna(now) and pd.isna(prev): 
+        return False
+    try:
+        return float(now) != float(prev)
+    except Exception:
+        return now != prev
+
+# This finds the next n snapshot positions starting at the given event_id.
+def _find_snapshot_positions(df: pd.DataFrame, event_id, n: int):
+    if not isinstance(df.index, pd.RangeIndex) or not df.index.is_unique:
+        df = df.reset_index(drop=True)
+    hits = df.index[df["event_id"] == event_id]
+    if len(hits) == 0:
+        raise ValueError(f"No rows found with event_id == {event_id!r}.")
+    start_pos = int(hits[0])
+
+    pos = []
+    need = max(1, int(n))
+    for i in range(start_pos, len(df)):
+        try:
+            if pd.notna(df.at[i, "EntryType"]) and int(df.at[i, "EntryType"]) == 1:
+                pos.append(i)
+                if len(pos) == need:
+                    break
+        except Exception:
+            pass
+    if not pos:
+        raise ValueError("No snapshots with EntryType == 1 found at/after the given event_id.")
+    return pos, df
+
+# This plots the order book table with highlighted changes based on flags.
+def plot_order_book_table_highlighted_flags(df: pd.DataFrame, event_id, n: int = 1, max_cols_per_row: int = 5, fig_width: int = 2500, changed_alpha: float = 0.65,):
+    # This builds the base figure.
+    fig = plot_order_book_table(df, event_id, n=n, max_cols_per_row=max_cols_per_row, fig_width=fig_width)
+
+    positions, df = _find_snapshot_positions(df, event_id, n)
+
+    # Similar to the ones above.
+    bid_fill_base = "rgba(46, 204, 113, 0.14)"
+    ask_fill_base = "rgba(231, 76,  60, 0.14)"
+    bid_fill_changed = f"rgba(46, 204, 113, {changed_alpha})"
+    ask_fill_changed = f"rgba(231, 76,  60, {changed_alpha})"
+
+    # For each table trace, this computes per-cell fills from change flags on that row
+    for traceIndex, pos in enumerate(positions):
+        row = df.iloc[pos]
+
+        # This finds the previous snapshot row (or None if none).
+        prev_pos = _prev_snapshot_pos(df, pos)
+        previousRow = df.iloc[prev_pos] if prev_pos is not None else None
+
+        bid_p, bid_s, bid_o, bid_lvls = _parse_side(row, "Bid")
+        ask_p, ask_s, ask_o, ask_lvls = _parse_side(row, "Ask")
+        r = max(len(bid_lvls), len(ask_lvls))
+
+        bo_fill, bs_fill, bp_fill = [], [], []
+        ap_fill, as_fill, ao_fill = [], [], []
+
+        for i in range(r):
+            if i < len(bid_lvls):
+                lvl = bid_lvls[i]
+                bp_fill.append(bid_fill_changed if _cell_changed(row, previousRow, "Bid", "Price",  lvl) else bid_fill_base)
+                bs_fill.append(bid_fill_changed if _cell_changed(row, previousRow, "Bid", "Size",   lvl) else bid_fill_base)
+                bo_fill.append(bid_fill_changed if _cell_changed(row, previousRow, "Bid", "Orders", lvl) else bid_fill_base)
+            else:
+                bp_fill.append(bid_fill_base); bs_fill.append(bid_fill_base); bo_fill.append(bid_fill_base)
+
+            if i < len(ask_lvls):
+                lvl = ask_lvls[i]
+                ap_fill.append(ask_fill_changed if _cell_changed(row, previousRow, "Ask", "Price",  lvl) else ask_fill_base)
+                as_fill.append(ask_fill_changed if _cell_changed(row, previousRow, "Ask", "Size",   lvl) else ask_fill_base)
+                ao_fill.append(ask_fill_changed if _cell_changed(row, previousRow, "Ask", "Orders", lvl) else ask_fill_base)
+            else:
+                ap_fill.append(ask_fill_base); as_fill.append(ask_fill_base); ao_fill.append(ask_fill_base)
+
+        t = fig.data[traceIndex]
+        t.cells.update(fill=dict(color=[bo_fill, bs_fill, bp_fill, ap_fill, as_fill, ao_fill]))
+
+    return fig
