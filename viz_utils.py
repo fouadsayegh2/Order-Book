@@ -2,6 +2,7 @@ import re, math
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from IPython.display import display
 
 def plot_order_book_table(df: pd.DataFrame, event_id, n: int = 1, max_cols_per_row: int = 5, fig_width: int = 2500):
     if not isinstance(df.index, pd.RangeIndex) or not df.index.is_unique:
@@ -274,7 +275,7 @@ def _find_snapshot_positions(df: pd.DataFrame, event_id, n: int):
 # This plots the order book table with highlighted changes based on flags.
 def plot_order_book_table_highlighted_flags(df: pd.DataFrame, event_id, n: int = 1, max_cols_per_row: int = 5, fig_width: int = 2500, changed_alpha: float = 0.65,):
     # This builds the base figure.
-    fig = plot_order_book_table(df, event_id, n=n, max_cols_per_row=max_cols_per_row, fig_width=fig_width)
+    figure = plot_order_book_table(df, event_id, n=n, max_cols_per_row=max_cols_per_row, fig_width=fig_width)
 
     positions, df = _find_snapshot_positions(df, event_id, n)
 
@@ -316,7 +317,147 @@ def plot_order_book_table_highlighted_flags(df: pd.DataFrame, event_id, n: int =
             else:
                 ap_fill.append(ask_fill_base); as_fill.append(ask_fill_base); ao_fill.append(ask_fill_base)
 
-        t = fig.data[traceIndex]
+        t = figure.data[traceIndex]
         t.cells.update(fill=dict(color=[bo_fill, bs_fill, bp_fill, ap_fill, as_fill, ao_fill]))
 
+    return figure
+
+
+def plot_recent_trades_table(df: pd.DataFrame, n: int = 50, newest_first: bool = True, up_to_event_id: int | None = None, up_to_index: int | None = None, event_id_col: str = "event_id", timestamp_candidates: tuple[str, ...] = ("timestamp", "arrival_timestamp"),):
+    # This keeps only trades (EntryType == 4).
+    etTrades = pd.to_numeric(df["EntryType"], errors="coerce") # Numeric filtering.
+    trades = df.loc[etTrades.eq(4)].copy()
+
+    cutDone = False
+
+    # 1. Here, we take everything up to the snapshot row index.
+    if up_to_index is not None:
+        trades = trades.iloc[: up_to_index + 1]
+        cutDone = True
+        # head_df = df.iloc[: up_to_index + 1]
+        # et = pd.to_numeric(head_df["EntryType"], errors="coerce")
+        # trades = head_df.loc[et.eq(4)].copy()
+        # cutDone = True
+
+    # 2) If not, then by event_id, only if trades actually have event_id values.
+    if not cutDone and up_to_event_id is not None and event_id_col in trades.columns:
+        ev = pd.to_numeric(trades[event_id_col], errors="coerce")
+        if ev.notna().any():
+            trades = trades.loc[ev <= up_to_event_id]
+            cutDone = True
+
+    # 3) If not, then by time, we find the snapshot timestamp then keep trades up to that time.
+    if not cutDone and up_to_event_id is not None:
+        ts_col = next((c for c in timestamp_candidates if c in df.columns), None)
+        if ts_col:
+            # find the snapshot row’s timestamp
+            snap = df.loc[pd.to_numeric(df[event_id_col], errors="coerce") == up_to_event_id]
+            if not snap.empty:
+                cutoff = pd.to_datetime(snap.iloc[0][ts_col])
+                trades_ts = pd.to_datetime(trades[ts_col], errors="coerce")
+                trades = trades.loc[trades_ts <= cutoff]
+                cutDone = True
+
+
+    if trades.empty:
+        raise ValueError(
+            f"No trades found up to this point "
+            f"({'index' if up_to_index is not None else event_id_col} "
+            f"= {up_to_index if up_to_index is not None else up_to_event_id})."
+        )
+
+    # This ensures the newest trades are at the top.
+    if "timestamp" in trades.columns:
+        trades = trades.sort_values("timestamp")
+    elif "arrival_timestamp" in trades.columns:
+        trades = trades.sort_values("arrival_timestamp")
+    elif event_id_col in trades.columns:
+        trades = trades.sort_values(event_id_col)
+    else:
+        trades = trades.sort_index()
+
+    last_n = trades.tail(int(max(1, n)))
+    if newest_first:
+        last_n = last_n.iloc[::-1] # Flips the row order.
+
+    # This reads the real trade fields in the dataset (price columns with data).
+    if "TradePrice" in last_n.columns and last_n["TradePrice"].notna().any():
+        price_col = "TradePrice"
+    elif "LastTradePrice" in last_n.columns and last_n["LastTradePrice"].notna().any():
+        price_col = "LastTradePrice"
+    else:
+        raise KeyError(
+            "No price column with values found. Expected one of: TradePrice, LastTradePrice."
+        )
+
+    # TradeSide, 1 = sell -> red, -1 = buy -> green.
+    if "shift_tradeside" not in last_n.columns:
+        raise KeyError("TradeSide column is missing; cannot color trades.")
+    ts = pd.to_numeric(last_n["shift_tradeside"], errors="coerce")
+    tradeSide = ts.fillna(0).astype(int)
+
+    def row_font(s):
+        if s == 1: 
+            return "#e74c3c"
+        elif s == -1:
+            return "#2ecc71"
+        else:
+            return "#2c3e50"
+    
+    def row_fill(s):
+        if s == 1: 
+            return "rgba(231,76,60,0.45)"
+        elif s == -1:
+            return "rgba(46,204,113,0.45)"
+        else:
+            return "rgba(127,140,141,0.12)"
+
+    font_colors = [row_font(s) for s in tradeSide]
+    fill_colors = [row_fill(s) for s in tradeSide]
+
+    # Formatting the values.
+    def fmt_qty(x):
+        if pd.isna(x): return ""
+        try:
+            f = float(x)
+            return f"{int(f):,}" if abs(f - round(f)) < 1e-9 else f"{f:g}"
+        except Exception:
+            return str(x)
+
+    def fmt_price(x):
+        if pd.isna(x): return ""
+        try:
+            return f"{float(x):g}"
+        except Exception:
+            return str(x)
+
+    qty_vals   = [fmt_qty(v) for v in last_n.get("TradeQuantityTotal", [])]
+    price_vals = [fmt_price(v) for v in (last_n[price_col] if price_col else pd.Series([""]*len(last_n), index=last_n.index))]
+
+    table = go.Table(
+        columnwidth=[1.2, 1.1],
+        header=dict(
+            values=["TradeQuantityTotal", price_col or "TradePrice"],
+            align="center",
+            fill_color="#2c3e50",
+            font=dict(color="white", size=12),
+            height=28,
+        ),
+        cells=dict(
+            values=[qty_vals, price_vals],
+            align=["right", "right"],
+            height=26,
+            fill_color=[fill_colors, fill_colors],
+            font=dict(color=[font_colors, font_colors], size=12),
+        ),
+    )
+    fig = go.Figure([table])
+    fig.update_layout(
+        title=f"Last {len(last_n)} Trades",
+        title_x=0.5,
+        margin=dict(l=10, r=10, t=58, b=10),
+        width=700,
+        height=max(220, 26*len(last_n) + 90),
+    )
     return fig
+
