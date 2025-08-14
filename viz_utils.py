@@ -2,7 +2,6 @@ import re, math
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from IPython.display import display
 
 def plot_order_book_table(df: pd.DataFrame, event_id, n: int = 1, max_cols_per_row: int = 5, fig_width: int = 2500):
     if not isinstance(df.index, pd.RangeIndex) or not df.index.is_unique:
