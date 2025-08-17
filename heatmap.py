@@ -74,7 +74,7 @@ def orderbook_heatmap(df: pd.DataFrame, levels: int = 10, time_col: str = "arriv
     pmin = float(np.min(all_prices))
     pmax = float(np.max(all_prices))
     
-    # Ensures the grid is centered around the min/max prices with a margin.
+    # Ensures the grid is centered around the min / max prices with a margin.
     grid = np.arange(pmin - tick_size, pmax + 2*tick_size, tick_size)
 
     # Here, we prepare the Z matrices (order size (color intensity values)) for the asks and bids.
@@ -156,6 +156,6 @@ def orderbook_heatmap(df: pd.DataFrame, levels: int = 10, time_col: str = "arriv
         margin=dict(l=10, r=10, t=60, b=10),
     )
 
-    # ENsures the x-axis is a date/time type.
+    # Ensures the x-axis is a date / time type.
     fig.update_xaxes(type="date")
     return fig
