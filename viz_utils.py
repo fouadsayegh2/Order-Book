@@ -1,5 +1,6 @@
 import re, math
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -338,14 +339,14 @@ def plot_recent_trades_table(df: pd.DataFrame, n: int = 50, newest_first: bool =
         # trades = head_df.loc[et.eq(4)].copy()
         # cutDone = True
 
-    # 2) If not, then by event_id, only if trades actually have event_id values.
+    # 2. If not, then by event_id, only if trades actually have event_id values.
     if not cutDone and up_to_event_id is not None and event_id_col in trades.columns:
         ev = pd.to_numeric(trades[event_id_col], errors="coerce")
         if ev.notna().any():
             trades = trades.loc[ev <= up_to_event_id]
             cutDone = True
 
-    # 3) If not, then by time, we find the snapshot timestamp then keep trades up to that time.
+    # 3. If not, then by time, we find the snapshot timestamp then keep trades up to that time.
     if not cutDone and up_to_event_id is not None:
         ts_col = next((c for c in timestamp_candidates if c in df.columns), None)
         if ts_col:
@@ -460,3 +461,79 @@ def plot_recent_trades_table(df: pd.DataFrame, n: int = 50, newest_first: bool =
     )
     return fig
 
+
+# This calculates the BBO and volatility.
+def plot_pbook_interactive(pbook: pd.DataFrame, window: int = 50) -> go.Figure:
+    df = pbook.copy()
+    df['arrival_timestamp'] = pd.to_datetime(df['arrival_timestamp'])
+
+    # This filters to only keep data between 10:00 and 15:00.
+    df = df[
+        (df['arrival_timestamp'].dt.time >= pd.to_datetime("10:01").time()) &
+        (df['arrival_timestamp'].dt.time <= pd.to_datetime("15:00").time())
+    ].copy()
+
+    df = df.replace(0, np.nan) # This turn 0 into NaN
+    df = df.dropna(subset=["AskPrice0", "BidPrice0"]) # This drops the rows where either column is NaN.
+
+
+    df = df.sort_values('arrival_timestamp')
+
+    # This computess the mid-price.
+    df['mid_price'] = (df["AskPrice0"] + df["BidPrice0"]) / 2
+
+    # Rolling std as volatility.
+    df['volatility'] = df['mid_price'].rolling(window=window).std()
+
+    # Marks the Bid/Ask Changes.
+    bid_chg = df['BidPrice0'].ne(df['BidPrice0'].shift())
+    ask_chg = df['AskPrice0'].ne(df['AskPrice0'].shift())
+
+    # A Two-row subplot with a shared x-axis.
+    figure = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.1,
+        row_heights=[0.7, 0.5], # Top taller than bottom.
+        subplot_titles=("BBO (Best Bid/Ask)", f"Volatility (rolling std, window={window})")
+    )
+
+    # This is Row 1: BBO.
+    figure.add_trace(go.Scatter(
+        x=df['arrival_timestamp'], y=df['BidPrice0'],
+        mode='lines', name='BidPrice0', line=dict(color='green')
+    ), row=1, col=1)
+    figure.add_trace(go.Scatter(
+        x=df['arrival_timestamp'], y=df['AskPrice0'],
+        mode='lines', name='AskPrice0', line=dict(color='red')
+    ), row=1, col=1)
+
+    # This marks the changes.
+    figure.add_trace(go.Scatter(
+        x=df.loc[bid_chg, 'arrival_timestamp'], y=df.loc[bid_chg, 'BidPrice0'],
+        mode='markers', name='Bid change', marker=dict(symbol='x', size=6, color='green')
+    ), row=1, col=1)
+    figure.add_trace(go.Scatter(
+        x=df.loc[ask_chg, 'arrival_timestamp'], y=df.loc[ask_chg, 'AskPrice0'],
+        mode='markers', name='Ask change', marker=dict(symbol='x', size=6, color='red')
+    ), row=1, col=1)
+
+    # This is Row 2: Volatility.
+    figure.add_trace(go.Scatter(
+        x=df['arrival_timestamp'], y=df['volatility'],
+        mode='lines', name=f'Volatility ({window})', line=dict(color='blue', dash='dot')
+    ), row=2, col=1)
+
+    # Layout.
+    figure.update_layout(
+        title=f"BBO & Volatility for symbol {df.StockId.iloc[0]} on {df.arrival_timestamp.iloc[0].date()}",
+        height=800,
+        hovermode='x unified',
+        showlegend=True,
+        margin=dict(l=40, r=20, t=40, b=40)
+    )
+    figure.update_yaxes(title_text="Price", row=1, col=1)
+    figure.update_yaxes(title_text="Volatility", row=2, col=1)
+    figure.update_xaxes(title_text="Timestamp", tickformat="%H:%M")
+
+    return figure

@@ -60,12 +60,16 @@ def orderbook_heatmap(df: pd.DataFrame, levels: int = 10, time_col: str = "arriv
         raise ValueError("All prices are NaN/invalid.")
 
     def get_tick_size(price):
-        if price <= 24.99: return 0.01
-        elif price <= 49.98: return 0.02
-        elif price <= 99.95: return 0.05
-        elif price <= 249.90: return 0.10
-        elif price <= 499.80: return 0.20
-        else: return 0.50
+        if price < 10:
+            return 0.01
+        elif price < 25.00:
+            return 0.02
+        elif price < 50.00:
+            return 0.05
+        elif price < 100.00:
+            return 0.10
+        else:
+            return 0.20
 
     if tick_size is None:
         mid_price = np.median(all_prices)
