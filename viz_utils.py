@@ -4,6 +4,36 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+# TICK SIZE:
+
+# def get_tick_size(price):
+#     if price < 10:
+#         return 0.01
+#     elif price < 25.00:
+#         return 0.02
+#     elif price < 50.00:
+#         return 0.05
+#     elif price < 100.00:
+#         return 0.10
+#     else:
+#         return 0.20
+        
+def get_tick_size(price: float) -> float:
+    if price < 25.00:
+        return 0.01
+    elif price < 50.00:
+        return 0.02
+    elif price < 100.00:
+        return 0.05
+    elif price < 250.00:
+        return 0.10
+    elif price < 500.00:
+        return 0.20
+    else:
+        return 0.50
+
+# PBOOK:
+
 def plot_order_book_table(df: pd.DataFrame, event_id, n: int = 1, max_cols_per_row: int = 5, fig_width: int = 2500):
     if not isinstance(df.index, pd.RangeIndex) or not df.index.is_unique:
         df = df.reset_index(drop=True)
@@ -462,6 +492,8 @@ def plot_recent_trades_table(df: pd.DataFrame, n: int = 50, newest_first: bool =
     return fig
 
 
+# BBO AND VOLATILITY FIGURES:
+
 # This calculates the BBO and volatility.
 def plot_pbook_interactive(pbook: pd.DataFrame, window: int = 50) -> go.Figure:
     df = pbook.copy()
@@ -537,3 +569,187 @@ def plot_pbook_interactive(pbook: pd.DataFrame, window: int = 50) -> go.Figure:
     figure.update_xaxes(title_text="Timestamp", tickformat="%H:%M")
 
     return figure
+
+# MATCHING ALGORITHM:
+
+# This is a helper function that prepares the order book snapshot in a clean format for the matching algorith to use.
+def levels_from_row(row: pd.Series, side_prefix: str) -> list[tuple[float, float]]:
+    out = []
+    i = 0
+    while True:
+        price_key = f"{side_prefix}Price{i}"
+        size_key  = f"{side_prefix}Size{i}"
+
+        # Stop when neither column exists (we've passed the last level)
+        if price_key not in row and size_key not in row:
+            break
+
+        p = pd.to_numeric(row.get(price_key), errors="coerce")
+        s = pd.to_numeric(row.get(size_key),  errors="coerce")
+        if pd.notna(p) and pd.notna(s):
+            out.append((float(p), float(s)))
+        i += 1
+    return out
+
+
+def auction_match_row(row: pd.Series, debug: bool = False) -> tuple[float, float, str]:
+    # This reads the ladder.
+    bids = levels_from_row(row, "Bid")
+    asks = levels_from_row(row, "Ask")
+    if not bids or not asks:
+        return (np.nan, np.nan, "NONE")
+
+    bp_all = np.array([p for p, _ in bids], dtype=float)
+    bs_all = np.array([s for _, s in bids], dtype=float)
+    ap_all = np.array([p for p, _ in asks], dtype=float)
+    as_all = np.array([s for _, s in asks], dtype=float)
+
+    # This is the positive-price arrays.
+    bid_prices = bp_all[bp_all > 0.0]
+    bid_sizes  = bs_all[bp_all > 0.0]
+    ask_prices = ap_all[ap_all > 0.0]
+    ask_sizes  = as_all[ap_all > 0.0]
+    if bid_prices.size == 0 or ask_prices.size == 0:
+        return (np.nan, np.nan, "NONE")
+
+    best_bid = float(bid_prices.max())
+    best_ask = float(ask_prices.min())
+
+    # The candidate prices.
+    cand_union = sorted(set(bid_prices.tolist() + ask_prices.tolist()))
+    cand_math  = [p for p in cand_union if best_ask <= p <= best_bid] or cand_union
+
+    has_zero_on_ladder = bool((bp_all == 0.0).any() or (ap_all == 0.0).any())
+    cand_print = ([0.0] if has_zero_on_ladder else []) + cand_math
+
+    # This builds the results for printing (includes p=0.0).
+    results_print = []
+    for p in cand_print:
+        bid_qty = bid_sizes[bid_prices >= p].sum()
+        ask_qty = ask_sizes[ask_prices <= p].sum()
+        exec_vol = min(bid_qty, ask_qty)
+        imbalance = bid_qty - ask_qty
+        results_print.append((p, exec_vol, imbalance))
+
+    results = []
+    for p in cand_math:
+        bid_qty = bid_sizes[bid_prices >= p].sum()
+        ask_qty = ask_sizes[ask_prices <= p].sum()
+        exec_vol = min(bid_qty, ask_qty)
+        imbalance = bid_qty - ask_qty
+        results.append((p, exec_vol, imbalance))
+
+    if debug:
+        print("=== Auction Debug Snapshot ===")
+        print("Bid levels:", bids)
+        print("Ask levels:", asks)
+        print("Candidate prices:", cand_print) # This shows the 0.0 if present.
+        for p, exec_vol, imb in results_print:
+            print(f"p={p:.2f}, exec_vol={exec_vol}, imbalance={imb}")
+        try:
+            ev_2795 = next(ev for p, ev, imb in results_print if abs(p-27.95) < 1e-6)
+            ev_2800 = next(ev for p, ev, imb in results_print if abs(p-28.00) < 1e-6)
+            print(f"Extra buy needed at 28.00 = {ev_2795 - ev_2800}")
+        except StopIteration:
+            pass
+        print("==============================")
+
+    # This chooses the price with max executable volume.
+    max_exec = max(r[1] for r in results)
+    winners = [r for r in results if r[1] == max_exec]
+
+    # This minimizes the residual (unmatched quantity).
+    min_abs_imb = min(abs(r[2]) for r in winners)
+    winners = [r for r in winners if abs(r[2]) == min_abs_imb]
+
+    # A tie-break by side of residual.
+    imbs = [r[2] for r in winners]
+    pos_only = all(imb > 0 for imb in imbs)
+    neg_only = all(imb < 0 for imb in imbs)
+
+    if pos_only:
+        # (a) An imbalance on buy side only -> highest price.
+        p_star, exec_star, imb = max(winners, key=lambda r: r[0])
+    elif neg_only:
+        # (b) An imbalance on sell side only -> lowest price
+        p_star, exec_star, imb = min(winners, key=lambda r: r[0])
+    else:
+        # (c) An imbalance on both sides -> average of (a) and (b), then round to closest tick.
+        p_low  = min(r[0] for r in winners)
+        p_high = max(r[0] for r in winners)
+        p_avg  = (p_low + p_high) / 2.0
+        tick   = get_tick_size(p_avg)
+        p_star = float(np.round(p_avg / tick) * tick)
+
+        # The exec volume and side at p_star should reflect that clearing (recompute imbalance sign).
+        bid_qty = bid_sizes[bid_prices >= p_star].sum()
+        ask_qty = ask_sizes[ask_prices <= p_star].sum()
+        exec_star = float(min(bid_qty, ask_qty))
+        imb = float(bid_qty - ask_qty)
+
+    side = "BUY" if imb > 0 else ("SELL" if imb < 0 else "NONE")
+    return (float(p_star), float(exec_star), side)
+
+COLUMNS = [
+    'arrival_timestamp','Source','StockId','SeqNo','EntryType',
+    'OrderbookStateCode','OrderbookFlush','TradePrice',
+    # Bids
+    'BidPrice0','BidPrice1','BidPrice2','BidPrice3','BidPrice4',
+    'BidPrice5','BidPrice6','BidPrice7','BidPrice8','BidPrice9',
+    'BidPrice10','BidPrice11','BidPrice12','BidPrice13','BidPrice14',
+    'BidPrice15','BidPrice16','BidPrice17','BidPrice18','BidPrice19',
+    'BidSize0','BidSize1','BidSize2','BidSize3','BidSize4',
+    'BidSize5','BidSize6','BidSize7','BidSize8','BidSize9',
+    'BidSize10','BidSize11','BidSize12','BidSize13','BidSize14',
+    'BidSize15','BidSize16','BidSize17','BidSize18','BidSize19',
+    'BidOrders0','BidOrders1','BidOrders2','BidOrders3','BidOrders4',
+    'BidOrders5','BidOrders6','BidOrders7','BidOrders8','BidOrders9',
+    'BidOrders10','BidOrders11','BidOrders12','BidOrders13','BidOrders14',
+    'BidOrders15','BidOrders16','BidOrders17','BidOrders18','BidOrders19',
+    # Asks
+    'AskPrice0','AskPrice1','AskPrice2','AskPrice3','AskPrice4',
+    'AskPrice5','AskPrice6','AskPrice7','AskPrice8','AskPrice9',
+    'AskPrice10','AskPrice11','AskPrice12','AskPrice13','AskPrice14',
+    'AskPrice15','AskPrice16','AskPrice17','AskPrice18','AskPrice19',
+    'AskSize0','AskSize1','AskSize2','AskSize3','AskSize4',
+    'AskSize5','AskSize6','AskSize7','AskSize8','AskSize9',
+    'AskSize10','AskSize11','AskSize12','AskSize13','AskSize14',
+    'AskSize15','AskSize16','AskSize17','AskSize18','AskSize19',
+    'AskOrders0','AskOrders1','AskOrders2','AskOrders3','AskOrders4',
+    'AskOrders5','AskOrders6','AskOrders7','AskOrders8','AskOrders9',
+    'AskOrders10','AskOrders11','AskOrders12','AskOrders13','AskOrders14',
+    'AskOrders15','AskOrders16','AskOrders17','AskOrders18','AskOrders19'
+]
+
+
+# This adds 3 new columns on auction rows only.
+def add_auction_columns(df: pd.DataFrame, time_col: str = "arrival_timestamp") -> pd.DataFrame:
+    out = df.loc[:, COLUMNS].copy()
+
+    if time_col not in out.columns:
+        raise KeyError(f"Missing time column '{time_col}'")
+    out[time_col] = pd.to_datetime(out[time_col], errors="coerce")
+ 
+    # This only keeps quote updates of EntryType == 1.
+    if "EntryType" in out.columns:
+        out = out[out["EntryType"] == 1].copy()
+
+    # This initializes new columns.
+    out["auction_price"] = np.nan
+    out["auction_size"]  = np.nan
+    out["auction_side"]  = "NONE"
+
+    # This runs the matcher only for rows where OrderbookSateCode = 4 (in the auction).
+    idxs = out.index[out["OrderbookStateCode"] == 4]
+
+    # This runs the matcher row-by-row on those indexed rows.
+    for i in idxs:
+        p, sz, side = auction_match_row(out.loc[i])
+        out.at[i, "auction_price"] = p
+        out.at[i, "auction_size"] = sz
+        out.at[i, "auction_side"] = side
+
+    # This drops the first row.
+    out = out.iloc[1:].copy()
+
+    return out

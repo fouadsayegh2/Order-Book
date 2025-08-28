@@ -2,6 +2,7 @@ import re
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from viz_utils import get_tick_size
 
 
 # We build a two-tone heat map (asks red, bids green) where Y is price and darkness reflects size.
@@ -58,18 +59,6 @@ def orderbook_heatmap(df: pd.DataFrame, levels: int = 10, time_col: str = "arriv
     all_prices = all_prices[np.isfinite(all_prices)] # Remove NaNs and invalids.
     if all_prices.size == 0:
         raise ValueError("All prices are NaN/invalid.")
-
-    def get_tick_size(price):
-        if price < 10:
-            return 0.01
-        elif price < 25.00:
-            return 0.02
-        elif price < 50.00:
-            return 0.05
-        elif price < 100.00:
-            return 0.10
-        else:
-            return 0.20
 
     if tick_size is None:
         mid_price = np.median(all_prices)
