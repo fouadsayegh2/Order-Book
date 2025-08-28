@@ -573,7 +573,7 @@ def plot_pbook_interactive(pbook: pd.DataFrame, window: int = 50) -> go.Figure:
 # MATCHING ALGORITHM:
 
 # This is a helper function that prepares the order book snapshot in a clean format for the matching algorith to use.
-def levels_from_row(row: pd.Series, side_prefix: str) -> list[tuple[float, float]]:
+def levels_from_row(row: pd.Series, side_prefix: str, debug: bool = False) -> list[tuple[float, float]]:
     out = []
     i = 0
     while True:
@@ -587,15 +587,21 @@ def levels_from_row(row: pd.Series, side_prefix: str) -> list[tuple[float, float
         p = pd.to_numeric(row.get(price_key), errors="coerce")
         s = pd.to_numeric(row.get(size_key),  errors="coerce")
         if pd.notna(p) and pd.notna(s):
+            if debug:
+                print(f"{side_prefix} level {i}: {price_key}={p}, {size_key}={s}")
             out.append((float(p), float(s)))
         i += 1
+
+    if debug:
+        print(f"Total {side_prefix} levels used: {len(out)}\n")
+
     return out
 
 
 def auction_match_row(row: pd.Series, debug: bool = False) -> tuple[float, float, str]:
     # This reads the ladder.
-    bids = levels_from_row(row, "Bid")
-    asks = levels_from_row(row, "Ask")
+    bids = levels_from_row(row, "Bid", debug=False)
+    asks = levels_from_row(row, "Ask", debug=False)
     if not bids or not asks:
         return (np.nan, np.nan, "NONE")
 
@@ -604,7 +610,11 @@ def auction_match_row(row: pd.Series, debug: bool = False) -> tuple[float, float
     ap_all = np.array([p for p, _ in asks], dtype=float)
     as_all = np.array([s for _, s in asks], dtype=float)
 
-    # This is the positive-price arrays.
+    # This separates the market orders (0.0 prices) from limit orders.
+    bid_market_vol = bs_all[bp_all == 0.0].sum() if (bp_all == 0.0).any() else 0.0
+    ask_market_vol = as_all[ap_all == 0.0].sum() if (ap_all == 0.0).any() else 0.0
+    
+    # This is the positive-price arrays (limit orders only).
     bid_prices = bp_all[bp_all > 0.0]
     bid_sizes  = bs_all[bp_all > 0.0]
     ask_prices = ap_all[ap_all > 0.0]
@@ -615,9 +625,18 @@ def auction_match_row(row: pd.Series, debug: bool = False) -> tuple[float, float
     best_bid = float(bid_prices.max())
     best_ask = float(ask_prices.min())
 
-    # The candidate prices.
+    # The candidate prices: use all prices in crossed markets, crossing range in normal markets.
     cand_union = sorted(set(bid_prices.tolist() + ask_prices.tolist()))
-    cand_math  = [p for p in cand_union if best_ask <= p <= best_bid] or cand_union
+    
+    # This checks if market is crossed
+    market_is_crossed = best_bid > best_ask
+    
+    if market_is_crossed:
+        # In crossed markets, use all prices as candidates.
+        cand_math = cand_union
+    else:
+        # In normal markets, use crossing range or fallback to all prices.
+        cand_math = [p for p in cand_union if best_ask <= p <= best_bid] or cand_union
 
     has_zero_on_ladder = bool((bp_all == 0.0).any() or (ap_all == 0.0).any())
     cand_print = ([0.0] if has_zero_on_ladder else []) + cand_math
@@ -625,16 +644,23 @@ def auction_match_row(row: pd.Series, debug: bool = False) -> tuple[float, float
     # This builds the results for printing (includes p=0.0).
     results_print = []
     for p in cand_print:
-        bid_qty = bid_sizes[bid_prices >= p].sum()
-        ask_qty = ask_sizes[ask_prices <= p].sum()
-        exec_vol = min(bid_qty, ask_qty)
-        imbalance = bid_qty - ask_qty
+        if p == 0.0:
+            # At price 0, no limit orders execute, only market vs market.
+            exec_vol = min(bid_market_vol, ask_market_vol)
+            imbalance = bid_market_vol - ask_market_vol
+        else:
+            # For limit orders: market orders participate + limit orders at/better than price.
+            bid_qty = bid_sizes[bid_prices >= p].sum() + bid_market_vol
+            ask_qty = ask_sizes[ask_prices <= p].sum() + ask_market_vol
+            exec_vol = min(bid_qty, ask_qty)
+            imbalance = bid_qty - ask_qty
         results_print.append((p, exec_vol, imbalance))
 
     results = []
     for p in cand_math:
-        bid_qty = bid_sizes[bid_prices >= p].sum()
-        ask_qty = ask_sizes[ask_prices <= p].sum()
+        # For limit orders: market orders participate + limit orders at/better than price.
+        bid_qty = bid_sizes[bid_prices >= p].sum() + bid_market_vol
+        ask_qty = ask_sizes[ask_prices <= p].sum() + ask_market_vol
         exec_vol = min(bid_qty, ask_qty)
         imbalance = bid_qty - ask_qty
         results.append((p, exec_vol, imbalance))
@@ -724,7 +750,8 @@ COLUMNS = [
 
 # This adds 3 new columns on auction rows only.
 def add_auction_columns(df: pd.DataFrame, time_col: str = "arrival_timestamp") -> pd.DataFrame:
-    out = df.loc[:, COLUMNS].copy()
+    # out = df.loc[:, COLUMNS].copy()
+    out = df.copy()
 
     if time_col not in out.columns:
         raise KeyError(f"Missing time column '{time_col}'")
@@ -744,7 +771,7 @@ def add_auction_columns(df: pd.DataFrame, time_col: str = "arrival_timestamp") -
 
     # This runs the matcher row-by-row on those indexed rows.
     for i in idxs:
-        p, sz, side = auction_match_row(out.loc[i])
+        p, sz, side = auction_match_row(out.loc[i], debug=False)
         out.at[i, "auction_price"] = p
         out.at[i, "auction_size"] = sz
         out.at[i, "auction_side"] = side

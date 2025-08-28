@@ -40,20 +40,22 @@ COLUMNS = [
 
 # MATCHING ALGORITHM:
 
-def get_tick_size(price):
-        if price < 10:
-            return 0.01
-        elif price < 25.00:
-            return 0.02
-        elif price < 50.00:
-            return 0.05
-        elif price < 100.00:
-            return 0.10
-        else:
-            return 0.20
+def get_tick_size(price: float) -> float:
+    if price < 25.00:
+        return 0.01
+    elif price < 50.00:
+        return 0.02
+    elif price < 100.00:
+        return 0.05
+    elif price < 250.00:
+        return 0.10
+    elif price < 500.00:
+        return 0.20
+    else:
+        return 0.50
 
 # This is a helper function that prepares the order book snapshot in a clean format for the matching algorith to use.
-def levels_from_row(row: pd.Series, side_prefix: str) -> list[tuple[float, float]]:
+def levels_from_row(row: pd.Series, side_prefix: str, debug: bool = False) -> list[tuple[float, float]]:
     out = []
     i = 0
     while True:
@@ -67,15 +69,22 @@ def levels_from_row(row: pd.Series, side_prefix: str) -> list[tuple[float, float
         p = pd.to_numeric(row.get(price_key), errors="coerce")
         s = pd.to_numeric(row.get(size_key),  errors="coerce")
         if pd.notna(p) and pd.notna(s):
+            if debug:
+                print(f"{side_prefix} level {i}: {price_key}={p}, {size_key}={s}")
             out.append((float(p), float(s)))
         i += 1
+
+    if debug:
+        print(f"Total {side_prefix} levels used: {len(out)}\n")
+
     return out
+
 
 
 def auction_match_row(row: pd.Series, debug: bool = False) -> tuple[float, float, str]:
     # This reads the ladder.
-    bids = levels_from_row(row, "Bid")
-    asks = levels_from_row(row, "Ask")
+    bids = levels_from_row(row, "Bid", debug=False)
+    asks = levels_from_row(row, "Ask", debug=False)
     if not bids or not asks:
         return (np.nan, np.nan, "NONE")
 
@@ -84,7 +93,11 @@ def auction_match_row(row: pd.Series, debug: bool = False) -> tuple[float, float
     ap_all = np.array([p for p, _ in asks], dtype=float)
     as_all = np.array([s for _, s in asks], dtype=float)
 
-    # This is the positive-price arrays.
+    # This separates the market orders (0.0 prices) from limit orders.
+    bid_market_vol = bs_all[bp_all == 0.0].sum() if (bp_all == 0.0).any() else 0.0
+    ask_market_vol = as_all[ap_all == 0.0].sum() if (ap_all == 0.0).any() else 0.0
+    
+    # This is the positive-price arrays (limit orders only).
     bid_prices = bp_all[bp_all > 0.0]
     bid_sizes  = bs_all[bp_all > 0.0]
     ask_prices = ap_all[ap_all > 0.0]
@@ -95,9 +108,18 @@ def auction_match_row(row: pd.Series, debug: bool = False) -> tuple[float, float
     best_bid = float(bid_prices.max())
     best_ask = float(ask_prices.min())
 
-    # The candidate prices.
+    # The candidate prices: use all prices in crossed markets, crossing range in normal markets.
     cand_union = sorted(set(bid_prices.tolist() + ask_prices.tolist()))
-    cand_math  = [p for p in cand_union if best_ask <= p <= best_bid] or cand_union
+    
+    # This checks if market is crossed
+    market_is_crossed = best_bid > best_ask
+    
+    if market_is_crossed:
+        # In crossed markets, use all prices as candidates.
+        cand_math = cand_union
+    else:
+        # In normal markets, use crossing range or fallback to all prices.
+        cand_math = [p for p in cand_union if best_ask <= p <= best_bid] or cand_union
 
     has_zero_on_ladder = bool((bp_all == 0.0).any() or (ap_all == 0.0).any())
     cand_print = ([0.0] if has_zero_on_ladder else []) + cand_math
@@ -105,16 +127,23 @@ def auction_match_row(row: pd.Series, debug: bool = False) -> tuple[float, float
     # This builds the results for printing (includes p=0.0).
     results_print = []
     for p in cand_print:
-        bid_qty = bid_sizes[bid_prices >= p].sum()
-        ask_qty = ask_sizes[ask_prices <= p].sum()
-        exec_vol = min(bid_qty, ask_qty)
-        imbalance = bid_qty - ask_qty
+        if p == 0.0:
+            # At price 0, no limit orders execute, only market vs market.
+            exec_vol = min(bid_market_vol, ask_market_vol)
+            imbalance = bid_market_vol - ask_market_vol
+        else:
+            # For limit orders: market orders participate + limit orders at/better than price.
+            bid_qty = bid_sizes[bid_prices >= p].sum() + bid_market_vol
+            ask_qty = ask_sizes[ask_prices <= p].sum() + ask_market_vol
+            exec_vol = min(bid_qty, ask_qty)
+            imbalance = bid_qty - ask_qty
         results_print.append((p, exec_vol, imbalance))
 
     results = []
     for p in cand_math:
-        bid_qty = bid_sizes[bid_prices >= p].sum()
-        ask_qty = ask_sizes[ask_prices <= p].sum()
+        # For limit orders: market orders participate + limit orders at/better than price.
+        bid_qty = bid_sizes[bid_prices >= p].sum() + bid_market_vol
+        ask_qty = ask_sizes[ask_prices <= p].sum() + ask_market_vol
         exec_vol = min(bid_qty, ask_qty)
         imbalance = bid_qty - ask_qty
         results.append((p, exec_vol, imbalance))
@@ -123,10 +152,9 @@ def auction_match_row(row: pd.Series, debug: bool = False) -> tuple[float, float
         print("=== Auction Debug Snapshot ===")
         print("Bid levels:", bids)
         print("Ask levels:", asks)
-        print("Candidate prices:", cand_print)  # This shows the 0.0 if present.
+        print("Candidate prices:", cand_print) # This shows the 0.0 if present.
         for p, exec_vol, imb in results_print:
             print(f"p={p:.2f}, exec_vol={exec_vol}, imbalance={imb}")
-        # Example: manual delta check between two candidate prices
         try:
             ev_2795 = next(ev for p, ev, imb in results_print if abs(p-27.95) < 1e-6)
             ev_2800 = next(ev for p, ev, imb in results_print if abs(p-28.00) < 1e-6)
@@ -170,6 +198,7 @@ def auction_match_row(row: pd.Series, debug: bool = False) -> tuple[float, float
 
     side = "BUY" if imb > 0 else ("SELL" if imb < 0 else "NONE")
     return (float(p_star), float(exec_star), side)
+
 
 def _pick_trade_price_col(df: pd.DataFrame) -> Optional[str]:
     prefs = ["TradePrice", "LastPrice", "LastPx", "PriceLast", "TradedPrice"]
@@ -285,15 +314,21 @@ def verify_auctions(
     if missing:
         raise KeyError(f"Missing required columns: {missing}")
 
-    # Compute open & close
-    open_comp,  open_rep  = _compute_auction_price_in_state(df, open_code,  debug=debug)
-    close_comp, close_rep = _compute_auction_price_in_state(df, close_code, debug=debug)
+    # Compute open & close without debug first to check results
+    open_comp,  open_rep  = _compute_auction_price_in_state(df, open_code,  debug=False)
+    close_comp, close_rep = _compute_auction_price_in_state(df, close_code, debug=False)
 
     def ok(comp, rep) -> bool:
         return (pd.notna(comp) and pd.notna(rep) and np.isclose(float(comp), float(rep), rtol=0.0, atol=1e-6))
 
     open_ok  = ok(open_comp,  open_rep)
     close_ok = ok(close_comp, close_rep)
+    
+    # Only print debug info if requested AND one or both auctions failed
+    if debug and not (open_ok and close_ok):
+        print(f"Debug info for {date} {symbol} (open_ok={open_ok}, close_ok={close_ok}):")
+        _compute_auction_price_in_state(df, open_code,  debug=True)
+        _compute_auction_price_in_state(df, close_code, debug=True)
 
     if   open_ok and close_ok: verdict = "both"
     elif open_ok:              verdict = "open_only"
@@ -319,12 +354,12 @@ def verify_auctions_bool(date: Union[int, str], symbol: int, **kwargs) -> bool:
     return r["open"]["match"] and r["close"]["match"]
 
 # ======== CONFIG: edit this to your parquet layout ========
-PATH_PATTERN = "20250813_4164.parquet"   # <-- change to your path pattern
+PATH_PATTERN = "20250811_4264.parquet"   # <-- change to your path pattern
 # ==========================================================
 
-dates = ['20250813']
+dates = ['20250811']
 
-symbols = [4164]
+symbols = [4264]
 
 all_results = []
 print("date      symbol   verdict        open(comp,rep,ok)        close(comp,rep,ok)")
@@ -377,7 +412,8 @@ except Exception:
 
 # This adds 3 new columns on auction rows only.
 def add_auction_columns(df: pd.DataFrame, time_col: str = "arrival_timestamp") -> pd.DataFrame:
-    out = df.loc[:, COLUMNS].copy()
+    # out = df.loc[:, COLUMNS].copy()
+    out = df.copy()
 
     if time_col not in out.columns:
         raise KeyError(f"Missing time column '{time_col}'")
@@ -397,7 +433,7 @@ def add_auction_columns(df: pd.DataFrame, time_col: str = "arrival_timestamp") -
 
     # This runs the matcher row-by-row on those indexed rows.
     for i in idxs:
-        p, sz, side = auction_match_row(out.loc[i])
+        p, sz, side = auction_match_row(out.loc[i], debug=False)
         out.at[i, "auction_price"] = p
         out.at[i, "auction_size"] = sz
         out.at[i, "auction_side"] = side
